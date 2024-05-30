@@ -13,7 +13,10 @@ from lvdm.basics import (
     avg_pool_nd,
     normalization
 )
-from lvdm.modules.attention import SpatialTransformer, TemporalTransformer
+from lvdm.modules.attention import SpatialTransformer, TemporalTransformer, EpipolarTransformer
+from lvdm.geometry.projection import get_world_rays
+from lvdm.geometry.epipolar_lines import project_rays
+from lvdm.visualization.drawing.lines import draw_attn
 
 
 class TimestepBlock(nn.Module):
@@ -33,7 +36,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb, context=None, batch_size=None):
+    def forward(self, x, emb, context=None, batch_size=None, **kwargs):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb, batch_size=batch_size)
@@ -41,11 +44,78 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x = layer(x, context)
             elif isinstance(layer, TemporalTransformer):
                 x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
-                x = layer(x, context)
+                x = layer(x, context, **kwargs)
+                x = rearrange(x, 'b c f h w -> (b f) c h w')
+            elif isinstance(layer, EpipolarTransformer):
+                x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
+                b, c, t, h, w = x.shape
+                mask = self._calculate_attn_mask(kwargs['intrinsics'], kwargs['extrinsics'], b, t,h,w,x)
+                x = layer(x, context, mask, **kwargs)
                 x = rearrange(x, 'b c f h w -> (b f) c h w')
             else:
                 x = layer(x)
         return x
+    def _calculate_attn_mask(self, intrinsics, extrinsics, b, t,h,w,x):
+
+        xs = torch.linspace(0, 1, steps=w)
+        ys = torch.linspace(0, 1, steps=h)
+        grid = torch.stack(
+            torch.meshgrid(xs, ys, indexing='xy'), dim=-1).float().to(
+            x.device)
+
+        grid = rearrange(grid, "h w c  -> (h w) c")
+        grid = grid.repeat(t, 1)
+        attn_mask = []
+        for b in range(b):
+            k = torch.eye(3).float().to(
+                x.device)
+            k[0, 0] = intrinsics[b][0]
+            k[1, 1] = intrinsics[b][1]
+            k[0, 2] = 0.5
+            k[1, 2] = 0.5
+            source_intrinsics = k
+            source_intrinsics = source_intrinsics[None].repeat_interleave(t * w * h, 0)
+
+            source_extrinsics_all = []
+            target_extrinsics_all = []
+            for t1 in range(t):
+                source_extrinsics = torch.inverse(extrinsics[b][t1].to(
+                    x.device))
+                source_extrinsics_all.append(source_extrinsics[None].repeat_interleave(w * h, 0))
+                tmp_seq = []
+                for t2 in range(t):
+                    target_extrinsics = torch.inverse(extrinsics[b][t2].to(
+                        x.device))
+                    tmp_seq.append(target_extrinsics[None])
+                target_extrinsics_all.append(torch.cat(tmp_seq).repeat(w * h, 1, 1))
+
+            source_extrinsics_all = torch.cat(source_extrinsics_all)
+            target_extrinsics_all = torch.cat(target_extrinsics_all)
+            origin, direction = get_world_rays(grid.float(), source_extrinsics_all.float(), source_intrinsics.float())
+            origin = origin.repeat_interleave(t, 0)
+            direction = direction.repeat_interleave(t, 0)
+            source_intrinsics = source_intrinsics.repeat_interleave(t, 0)
+            projection = project_rays(
+                origin.float(), direction.float(), target_extrinsics_all.float(), source_intrinsics.float()
+            )
+
+            attn_image = torch.zeros((3, h, w)).to(
+                x.device).float()
+
+            attn_image = draw_attn(
+                attn_image,
+                projection["xy_min"],
+                projection["xy_max"],
+                (1, 1, 1),
+                4,
+                x_range=(0, 1),
+                y_range=(0, 1), )
+            attn_image = attn_image
+            attn_image = rearrange(attn_image, '(t1 a t2) b-> (t1 a) (t2 b)', t1=t, t2=t)
+            attn_mask.append(attn_image)
+        attn_mask = torch.stack(attn_mask).to(x.dtype)
+        return  attn_mask
+
 
 
 class Downsample(nn.Module):
@@ -365,6 +435,8 @@ class UNetModel(nn.Module):
         self.image_cross_attention_scale_learnable = image_cross_attention_scale_learnable
         self.default_fs = default_fs
         self.fs_condition = fs_condition
+        self.down_skip = 2
+        self.up_epipolar = 2
 
         ## Time embedding blocks
         self.time_embed = nn.Sequential(
@@ -434,6 +506,15 @@ class UNetModel(nn.Module):
                                 temporal_length=temporal_length
                             )
                         )
+                        if self.down_skip > 0 :
+                            self.down_skip = self.down_skip - 1
+                        else:
+                            layers.append(
+                                EpipolarTransformer(ch, num_heads, dim_head,
+                                    depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
+                                    use_checkpoint=use_checkpoint
+                                )
+                            )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
@@ -478,6 +559,12 @@ class UNetModel(nn.Module):
                     causal_attention=use_causal_attention, relative_position=use_relative_position, 
                     temporal_length=temporal_length
                 )
+            )
+            layers.append(
+                EpipolarTransformer(ch, num_heads, dim_head,
+                                    depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
+                                    use_checkpoint=use_checkpoint
+                                    )
             )
         layers.append(
             ResBlock(ch, time_embed_dim, dropout,
@@ -525,6 +612,15 @@ class UNetModel(nn.Module):
                                 temporal_length=temporal_length
                             )
                         )
+                        if self.up_epipolar > 0:
+                            self.up_epipolar -= 1
+                            layers.append(
+                                EpipolarTransformer(ch, num_heads, dim_head,
+                                    depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
+                                    use_checkpoint=use_checkpoint
+                                )
+                            )
+
                 if level and i == num_res_blocks:
                     out_ch = ch
                     layers.append(
@@ -580,7 +676,7 @@ class UNetModel(nn.Module):
         adapter_idx = 0
         hs = []
         for id, module in enumerate(self.input_blocks):
-            h = module(h, emb, context=context, batch_size=b)
+            h = module(h, emb, context=context, batch_size=b,**kwargs)
             if id ==0 and self.addition_attention:
                 h = self.init_attn(h, emb, context=context, batch_size=b)
             ## plug-in adapter features
@@ -591,10 +687,10 @@ class UNetModel(nn.Module):
         if features_adapter is not None:
             assert len(features_adapter)==adapter_idx, 'Wrong features_adapter'
 
-        h = self.middle_block(h, emb, context=context, batch_size=b)
+        h = self.middle_block(h, emb, context=context, batch_size=b,**kwargs)
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
-            h = module(h, emb, context=context, batch_size=b)
+            h = module(h, emb, context=context, batch_size=b,**kwargs)
         h = h.type(x.dtype)
         y = self.out(h)
         

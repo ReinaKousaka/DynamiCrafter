@@ -1050,7 +1050,10 @@ class LatentVisualDiffusion(LatentDiffusion):
                 param.requires_grad = False
 
     def shared_step(self, batch, random_uncond, **kwargs):
-        x, c, fs = self.get_batch_input(batch, random_uncond=random_uncond, return_fs=True)
+        kwargs['camera_embeddings'] = batch['camera_embeddings']
+        kwargs['intrinsics'] = batch['intrinsics']
+        kwargs['extrinsics'] = batch['extrinsics']
+        x, c, fs = self.get_batch_input(batch, random_uncond=random_uncond, return_fs=True)  
         kwargs.update({"fs": fs.long()})
         loss, loss_dict = self(x, c, **kwargs)
         return loss, loss_dict
@@ -1133,7 +1136,10 @@ class LatentVisualDiffusion(LatentDiffusion):
         ## TBD: currently, classifier_free_guidance sampling is only supported by DDIM
         use_ddim = ddim_steps is not None
         log = dict()
-
+        kwargs['camera_embeddings'] = batch['camera_embeddings']
+        kwargs['intrinsics'] = batch['intrinsics']
+        kwargs['extrinsics'] = batch['extrinsics']
+        
         z, c, xrec, xc, fs, cond_x = self.get_batch_input(batch, random_uncond=False,
                                                 return_first_stage_outputs=True,
                                                 return_original_cond=True,
@@ -1197,7 +1203,17 @@ class LatentVisualDiffusion(LatentDiffusion):
         """ configure_optimizers for LatentDiffusion """
         lr = self.learning_rate
 
-        params = list(self.model.parameters())
+        # params = list(self.model.parameters())
+
+        params = []
+        params_new = []
+        for name, param in self.model.named_parameters():
+            if 'cc_proj' in name or "Epipolar" in name:
+                params_new.append(param)
+                
+            else:
+                params.append(param)
+        # print(params_new)
         mainlogger.info(f"@Training [{len(params)}] Full Paramters.")
 
         if self.cond_stage_trainable:
@@ -1217,7 +1233,9 @@ class LatentVisualDiffusion(LatentDiffusion):
                 params.append(self.logvar)
 
         ## optimizer
-        optimizer = torch.optim.AdamW(params, lr=lr)
+        # optimizer = torch.optim.AdamW(params, lr=lr)
+        optimizer = torch.optim.AdamW([ {"params": params},
+                                       {"params": params_new, "lr": lr*8},], lr=lr)
 
         ## lr scheduler
         if self.use_scheduler:

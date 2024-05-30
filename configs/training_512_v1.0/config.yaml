@@ -1,5 +1,5 @@
 model:
-  pretrained_checkpoint: checkpoints/dynamicrafter_512_v1/model.ckpt
+  pretrained_checkpoint: model.ckpt
   base_learning_rate: 1.0e-05
   scale_lr: False
   target: lvdm.models.ddpm3d.LatentVisualDiffusion
@@ -112,28 +112,38 @@ model:
 data:
   target: utils_data.DataModuleFromConfig
   params:
-    batch_size: 2
-    num_workers: 12
+    batch_size: 1
+    num_workers: 8
     wrap: false
     train:
-      target: lvdm.data.webvid.WebVid
+      target: lvdm.data.data_epic.EpicKitchen
       params:
-        data_dir: <WebVid10M DATA>
-        meta_path: <.csv FILE>
-        video_length: 16
-        frame_stride: 6
-        load_raw_resolution: true
-        resolution: [320, 512]
-        spatial_transform: resize_center_crop
-        random_fs: true  ## if true, we uniformly sample fs with max_fs=frame_stride (above)
+        root: "/workspace/CameraCtrl/Epic"
+        # batch_size: 2
+        # num_workers: 12
+        h: 320
+        w: 512
+        sample_stride: 4
+        num_frames: 16
+
+# data:
+#   target: dataset_epic.EpicKitchen
+#   params:
+#     batch_size: 2
+#     num_workers: 12
+#     h: 320
+#     w: 512
+#     sample_stride: 4
+
+
 
 lightning:
   precision: 16
   # strategy: deepspeed_stage_2
   trainer:
     benchmark: True
-    accumulate_grad_batches: 2
-    max_steps: 100000
+    accumulate_grad_batches: 4
+    max_steps: 60000
     # logger
     log_every_n_steps: 50
     # val
@@ -144,20 +154,19 @@ lightning:
     model_checkpoint:
       target: pytorch_lightning.callbacks.ModelCheckpoint
       params:
-        every_n_train_steps: 9000 #1000
-        filename: "{epoch}-{step}"
+        filename: "{epoch}-{step}-weight.ckpt"
         save_weights_only: True
-    metrics_over_trainsteps_checkpoint:
-      target: pytorch_lightning.callbacks.ModelCheckpoint
-      params:
-        filename: '{epoch}-{step}'
-        save_weights_only: True
-        every_n_train_steps: 10000 #20000 # 3s/step*2w=
+          #    metrics_over_trainsteps_checkpoint:
+          #      target: pytorch_lightning.callbacks.ModelCheckpoint
+          #      params:
+          #        filename: '{epoch}-{step}'
+          #        save_weights_only: True
+          #        every_n_train_steps: 10 #20000 # 3s/step*2w=
     batch_logger:
       target: callbacks.ImageLogger
       params:
-        batch_frequency: 500
-        to_local: False
+        batch_frequency: 3000
+        to_local: True
         max_images: 8
         log_images_kwargs:
           ddim_steps: 50
