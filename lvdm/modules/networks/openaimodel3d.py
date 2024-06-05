@@ -44,12 +44,15 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
                 x = layer(x, context)
             elif isinstance(layer, TemporalTransformer):
                 x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
+                # print(f'mask_shape: {x.shape}, mult: {layer.mult}, index: {layer.index}')
                 x = layer(x, context, **kwargs)
                 x = rearrange(x, 'b c f h w -> (b f) c h w')
             elif isinstance(layer, EpipolarTransformer):
                 x = rearrange(x, '(b f) c h w -> b c f h w', b=batch_size)
-                b, c, t, h, w = x.shape
-                mask = self._calculate_attn_mask(kwargs['intrinsics'], kwargs['extrinsics'], b, t,h,w,x)
+                # b, c, t, h, w = x.shape
+                # print(f'mask_shape: {x.shape}, mult: {layer.mult}, index: {layer.index}')
+                # mask = self._calculate_attn_mask(kwargs['intrinsics'], kwargs['extrinsics'], b, t,h,w,x)
+                mask = None
                 x = layer(x, context, mask, **kwargs)
                 x = rearrange(x, 'b c f h w -> (b f) c h w')
             else:
@@ -436,8 +439,9 @@ class UNetModel(nn.Module):
         self.default_fs = default_fs
         self.fs_condition = fs_condition
         self.down_skip = 2
-        self.up_epipolar = 2
-
+        self.up_epipolar = 5
+        index = 0
+        index2 = 0
         ## Time embedding blocks
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
@@ -468,7 +472,9 @@ class UNetModel(nn.Module):
                     context_dim=context_dim,
                     use_checkpoint=use_checkpoint, only_self_att=temporal_selfatt_only, 
                     causal_attention=False, relative_position=use_relative_position, 
-                    temporal_length=temporal_length))
+                    temporal_length=temporal_length,
+                    mult = 1, index = index2))
+            index2+=1
 
         input_block_chans = [model_channels]
         ch = model_channels
@@ -503,18 +509,20 @@ class UNetModel(nn.Module):
                                 depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
                                 use_checkpoint=use_checkpoint, only_self_att=temporal_self_att_only, 
                                 causal_attention=use_causal_attention, relative_position=use_relative_position, 
-                                temporal_length=temporal_length
+                                temporal_length=temporal_length, mult = mult, index = index2
                             )
                         )
+                        index2+=1
                         if self.down_skip > 0 :
                             self.down_skip = self.down_skip - 1
                         else:
                             layers.append(
                                 EpipolarTransformer(ch, num_heads, dim_head,
                                     depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
-                                    use_checkpoint=use_checkpoint
+                                    use_checkpoint=use_checkpoint, mult = mult, index = index
                                 )
                             )
+                            index+=1
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
@@ -557,15 +565,17 @@ class UNetModel(nn.Module):
                     depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
                     use_checkpoint=use_checkpoint, only_self_att=temporal_self_att_only, 
                     causal_attention=use_causal_attention, relative_position=use_relative_position, 
-                    temporal_length=temporal_length
+                    temporal_length=temporal_length, mult = 8, index = index2
                 )
             )
+            index2+=1
             layers.append(
                 EpipolarTransformer(ch, num_heads, dim_head,
                                     depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
-                                    use_checkpoint=use_checkpoint
+                                    use_checkpoint=use_checkpoint, mult = 8, index = index
                                     )
             )
+            index+=1
         layers.append(
             ResBlock(ch, time_embed_dim, dropout,
                 dims=dims, use_checkpoint=use_checkpoint,
@@ -609,17 +619,19 @@ class UNetModel(nn.Module):
                                 depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
                                 use_checkpoint=use_checkpoint, only_self_att=temporal_self_att_only, 
                                 causal_attention=use_causal_attention, relative_position=use_relative_position, 
-                                temporal_length=temporal_length
+                                temporal_length=temporal_length, mult = mult, index = index2
                             )
                         )
+                        index2+=1
                         if self.up_epipolar > 0:
                             self.up_epipolar -= 1
                             layers.append(
                                 EpipolarTransformer(ch, num_heads, dim_head,
                                     depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
-                                    use_checkpoint=use_checkpoint
+                                    use_checkpoint=use_checkpoint, mult = mult, index = index
                                 )
                             )
+                            index+=1
 
                 if level and i == num_res_blocks:
                     out_ch = ch

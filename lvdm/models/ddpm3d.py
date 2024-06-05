@@ -32,6 +32,9 @@ from lvdm.common import (
     exists,
     default
 )
+from lvdm.geometry.projection import get_world_rays
+from lvdm.geometry.epipolar_lines import project_rays
+from lvdm.visualization.drawing.lines import draw_attn
 
 __conditioning_keys__ = {'concat': 'c_concat',
                          'crossattn': 'c_crossattn',
@@ -1053,11 +1056,81 @@ class LatentVisualDiffusion(LatentDiffusion):
         kwargs['camera_embeddings'] = batch['camera_embeddings']
         kwargs['intrinsics'] = batch['intrinsics']
         kwargs['extrinsics'] = batch['extrinsics']
+        kwargs['plucker_embedding'] = batch['plucker_embedding']
         x, c, fs = self.get_batch_input(batch, random_uncond=random_uncond, return_fs=True)  
+        tmp = []
+        b, _, t, h, w = x.shape
+        for s in range(3):
+            tmp.append(self._calculate_attn_mask(batch['intrinsics'], batch['extrinsics'], b,t,h// 2 ** (s + 1),w// 2 ** (s + 1),x,lw =4// 2 ** s))
+
+        kwargs['epipolar_masks'] = tmp
         kwargs.update({"fs": fs.long()})
         loss, loss_dict = self(x, c, **kwargs)
         return loss, loss_dict
-    
+
+
+    def _calculate_attn_mask(self, intrinsics, extrinsics, b, t,h,w,x,lw=4):
+
+        xs = torch.linspace(0, 1, steps=w)
+        ys = torch.linspace(0, 1, steps=h)
+        grid = torch.stack(
+            torch.meshgrid(xs, ys, indexing='xy'), dim=-1).float().to(
+            x.device)
+
+        grid = rearrange(grid, "h w c  -> (h w) c")
+        grid = grid.repeat(t, 1)
+        attn_mask = []
+        for b in range(b):
+            k = torch.eye(3).float().to(
+                x.device)
+            k[0, 0] = intrinsics[b][0]
+            k[1, 1] = intrinsics[b][1]
+            k[0, 2] = 0.5
+            k[1, 2] = 0.5
+            source_intrinsics = k
+            source_intrinsics = source_intrinsics[None].repeat_interleave(t * w * h, 0)
+
+            source_extrinsics_all = []
+            target_extrinsics_all = []
+            for t1 in range(t):
+                source_extrinsics = torch.inverse(extrinsics[b][t1].to(
+                    x.device))
+                source_extrinsics_all.append(source_extrinsics[None].repeat_interleave(w * h, 0))
+                tmp_seq = []
+                for t2 in range(t):
+                    target_extrinsics = torch.inverse(extrinsics[b][t2].to(
+                        x.device))
+                    tmp_seq.append(target_extrinsics[None])
+                target_extrinsics_all.append(torch.cat(tmp_seq).repeat(w * h, 1, 1))
+
+            source_extrinsics_all = torch.cat(source_extrinsics_all)
+            target_extrinsics_all = torch.cat(target_extrinsics_all)
+            origin, direction = get_world_rays(grid.float(), source_extrinsics_all.float(), source_intrinsics.float())
+            origin = origin.repeat_interleave(t, 0)
+            direction = direction.repeat_interleave(t, 0)
+            source_intrinsics = source_intrinsics.repeat_interleave(t, 0)
+            projection = project_rays(
+                origin.float(), direction.float(), target_extrinsics_all.float(), source_intrinsics.float()
+            )
+
+            attn_image = torch.zeros((3, h, w)).to(
+                x.device).float()
+
+            attn_image = draw_attn(
+                attn_image,
+                projection["xy_min"],
+                projection["xy_max"],
+                (1, 1, 1),
+                lw,
+                x_range=(0, 1),
+                y_range=(0, 1), )
+            attn_image = attn_image
+            attn_image = rearrange(attn_image, '(t1 a t2) b-> (t1 a) (t2 b)', t1=t, t2=t)
+            attn_mask.append(attn_image)
+        attn_mask = torch.stack(attn_mask).to(x.dtype)
+        return  attn_mask
+
+
     def get_batch_input(self, batch, random_uncond, return_first_stage_outputs=False, return_original_cond=False, return_fs=False, return_cond_frame=False, return_original_input=False, **kwargs):
         ## x: b c t h w
         x = super().get_input(batch, self.first_stage_key)
@@ -1137,6 +1210,7 @@ class LatentVisualDiffusion(LatentDiffusion):
         use_ddim = ddim_steps is not None
         log = dict()
         kwargs['camera_embeddings'] = batch['camera_embeddings']
+        kwargs['plucker_embedding'] = batch['plucker_embedding']
         kwargs['intrinsics'] = batch['intrinsics']
         kwargs['extrinsics'] = batch['extrinsics']
         
@@ -1145,6 +1219,12 @@ class LatentVisualDiffusion(LatentDiffusion):
                                                 return_original_cond=True,
                                                 return_fs=True,
                                                 return_cond_frame=True)
+        tmp = []
+        b, _, t, h, w = z.shape
+        for s in range(3):
+            tmp.append(self._calculate_attn_mask(batch['intrinsics'], batch['extrinsics'], b,t,h// 2 ** (s + 1),w// 2 ** (s + 1),z,lw =4// 2 ** s).half())
+
+        kwargs['epipolar_masks'] = tmp
 
         N = xrec.shape[0]
         log["image_condition"] = cond_x

@@ -9,7 +9,7 @@ model:
     linear_start: 0.00085
     linear_end: 0.012
     num_timesteps_cond: 1
-    log_every_t: 200
+    log_every_t: 1500
     timesteps: 1000
     first_stage_key: video
     cond_stage_key: caption
@@ -23,7 +23,7 @@ model:
     use_ema: False
     uncond_prob: 0.05
     uncond_type: 'empty_seq'
-    rand_cond_frame: true
+    rand_cond_frame: True
     use_dynamic_rescale: true
     base_scale: 0.7
     fps_condition_type: 'fps'
@@ -116,26 +116,17 @@ data:
     num_workers: 8
     wrap: false
     train:
-      target: lvdm.data.data_epic.EpicKitchen
+      target: lvdm.data.realestate.RealEstate10KPose
       params:
-        root: "/workspace/CameraCtrl/Epic"
-        # batch_size: 2
-        # num_workers: 12
-        h: 320
-        w: 512
-        sample_stride: 4
-        num_frames: 16
-
-# data:
-#   target: dataset_epic.EpicKitchen
-#   params:
-#     batch_size: 2
-#     num_workers: 12
-#     h: 320
-#     w: 512
-#     sample_stride: 4
-
-
+        root_path:       "/workspace/DynamiCrafter/RealEstate"
+        sample_stride: 8
+        # sample_stride: 4
+        sample_n_frames: 16
+        relative_pose: true
+        zero_t_first_frame: true
+        sample_size: [320, 512]
+        rescale_fxy: true
+        use_flip: true
 
 lightning:
   precision: 16
@@ -165,7 +156,7 @@ lightning:
     batch_logger:
       target: callbacks.ImageLogger
       params:
-        batch_frequency: 3000
+        batch_frequency: 2000
         to_local: True
         max_images: 8
         log_images_kwargs:
