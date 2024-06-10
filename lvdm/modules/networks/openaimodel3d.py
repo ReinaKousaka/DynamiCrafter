@@ -500,7 +500,7 @@ class UNetModel(nn.Module):
                             depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
                             use_checkpoint=use_checkpoint, disable_self_attn=False, 
                             video_length=temporal_length, image_cross_attention=self.image_cross_attention,
-                            image_cross_attention_scale_learnable=self.image_cross_attention_scale_learnable,                      
+                            image_cross_attention_scale_learnable=self.image_cross_attention_scale_learnable,mult = mult,                         
                         )
                     )
                     if self.temporal_attention:
@@ -556,7 +556,7 @@ class UNetModel(nn.Module):
             SpatialTransformer(ch, num_heads, dim_head, 
                 depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
                 use_checkpoint=use_checkpoint, disable_self_attn=False, video_length=temporal_length, 
-                image_cross_attention=self.image_cross_attention,image_cross_attention_scale_learnable=self.image_cross_attention_scale_learnable                
+                image_cross_attention=self.image_cross_attention,image_cross_attention_scale_learnable=self.image_cross_attention_scale_learnable, mult = 8               
             )
         ]
         if self.temporal_attention:
@@ -610,7 +610,7 @@ class UNetModel(nn.Module):
                         SpatialTransformer(ch, num_heads, dim_head, 
                             depth=transformer_depth, context_dim=context_dim, use_linear=use_linear,
                             use_checkpoint=use_checkpoint, disable_self_attn=False, video_length=temporal_length,
-                            image_cross_attention=self.image_cross_attention,image_cross_attention_scale_learnable=self.image_cross_attention_scale_learnable    
+                            image_cross_attention=self.image_cross_attention,image_cross_attention_scale_learnable=self.image_cross_attention_scale_learnable , mult = mult,     
                         )
                     )
                     if self.temporal_attention:

@@ -1,5 +1,5 @@
 model:
-  pretrained_checkpoint: model.ckpt
+  pretrained_checkpoint: /workspace/DynamiCrafter/main/exp_epipolar_f7/training_512_v1.0/checkpoints/epoch=5-step=27162-weight.ckpt.ckpt
   base_learning_rate: 1.0e-05
   scale_lr: False
   target: lvdm.models.ddpm3d.LatentVisualDiffusion
@@ -23,7 +23,7 @@ model:
     use_ema: False
     uncond_prob: 0.05
     uncond_type: 'empty_seq'
-    rand_cond_frame: True
+    rand_cond_frame: false
     use_dynamic_rescale: true
     base_scale: 0.7
     fps_condition_type: 'fps'
@@ -116,17 +116,15 @@ data:
     num_workers: 8
     wrap: false
     train:
-      target: lvdm.data.realestate.RealEstate10KPose
+      target: lvdm.data.dataset_merged.EpicAndRealestate
       params:
-        root_path:       "/workspace/DynamiCrafter/RealEstate"
-        sample_stride: 8
-        # sample_stride: 4
-        sample_n_frames: 16
+        epic_root: "/workspace/Epic"
+        realestate_root: "/workspace/RealEstate"
+        num_frames: 16
         relative_pose: true
         zero_t_first_frame: true
-        sample_size: [320, 512]
-        rescale_fxy: true
-        use_flip: true
+        rescale_fxy: False
+
 
 lightning:
   precision: 16

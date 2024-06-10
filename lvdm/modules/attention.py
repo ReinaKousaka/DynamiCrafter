@@ -191,7 +191,7 @@ class RelativePosition(nn.Module):
 class CrossAttention(nn.Module):
 
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., 
-                 relative_position=False, temporal_length=None, video_length=None, image_cross_attention=False, image_cross_attention_scale=1.0, image_cross_attention_scale_learnable=False, text_context_len=77):
+                 relative_position=False, temporal_length=None, video_length=None, image_cross_attention=False, image_cross_attention_scale=1.0, image_cross_attention_scale_learnable=False, text_context_len=77,mult = None):
         super().__init__()
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
@@ -225,9 +225,12 @@ class CrossAttention(nn.Module):
             self.to_v_ip = nn.Linear(context_dim, inner_dim, bias=False)
             if image_cross_attention_scale_learnable:
                 self.register_parameter('alpha', nn.Parameter(torch.tensor(0.)) )
+        if mult and image_cross_attention_scale_learnable:
+            self.cc_proj = self.cc_proj = nn.Linear(query_dim +6*mult*mult, inner_dim)
+            self.act = nn.Sigmoid()
 
 
-    def forward(self, x, context=None, mask=None):
+    def forward(self, x, context=None, mask=None, cam = None):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
 
@@ -285,14 +288,15 @@ class CrossAttention(nn.Module):
 
 
         if out_ip is not None:
-            if self.image_cross_attention_scale_learnable:
-                out = out + self.image_cross_attention_scale * out_ip * (torch.tanh(self.alpha)+1)
+            if self.image_cross_attention_scale_learnable and cam is not None:
+                beta_z = self.act(self.cc_proj(torch.cat([x,cam],dim=-1)))
+                out = out + self.image_cross_attention_scale * out_ip * beta_z
             else:
                 out = out + self.image_cross_attention_scale * out_ip
         
         return self.to_out(out)
     
-    def efficient_forward(self, x, context=None, mask=None):
+    def efficient_forward(self, x, context=None, mask=None, cam = None):
         spatial_self_attn = (context is None)
         k_ip, v_ip, out_ip = None, None, None
 
@@ -350,8 +354,9 @@ class CrossAttention(nn.Module):
             .reshape(b, out.shape[1], self.heads * self.dim_head)
         )
         if out_ip is not None:
-            if self.image_cross_attention_scale_learnable:
-                out = out + self.image_cross_attention_scale * out_ip * (torch.tanh(self.alpha)+1)
+            if self.image_cross_attention_scale_learnable and cam is not None:
+                beta_z = self.act(self.cc_proj(torch.cat([x,cam],dim=-1)))
+                out = out + self.image_cross_attention_scale * out_ip * beta_z
             else:
                 out = out + self.image_cross_attention_scale * out_ip
            
@@ -361,36 +366,45 @@ class CrossAttention(nn.Module):
 class BasicTransformerBlock(nn.Module):
 
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
-                disable_self_attn=False, attention_cls=None, video_length=None, image_cross_attention=False, image_cross_attention_scale=1.0, image_cross_attention_scale_learnable=False, text_context_len=77):
+                disable_self_attn=False, attention_cls=None, video_length=None, image_cross_attention=False, image_cross_attention_scale=1.0, image_cross_attention_scale_learnable=False, text_context_len=77,mult = None):
         super().__init__()
         attn_cls = CrossAttention if attention_cls is None else attention_cls
         self.disable_self_attn = disable_self_attn
         self.attn1 = attn_cls(query_dim=dim, heads=n_heads, dim_head=d_head, dropout=dropout,
             context_dim=context_dim if self.disable_self_attn else None)
         self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-        self.attn2 = attn_cls(query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout, video_length=video_length, image_cross_attention=image_cross_attention, image_cross_attention_scale=image_cross_attention_scale, image_cross_attention_scale_learnable=image_cross_attention_scale_learnable,text_context_len=text_context_len)
+        self.attn2 = attn_cls(query_dim=dim, context_dim=context_dim, heads=n_heads, dim_head=d_head, dropout=dropout, video_length=video_length, image_cross_attention=image_cross_attention, image_cross_attention_scale=image_cross_attention_scale, image_cross_attention_scale_learnable=image_cross_attention_scale_learnable,text_context_len=text_context_len,mult = mult)
         self.image_cross_attention = image_cross_attention
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
         self.checkpoint = checkpoint
+        self.image_cross_attention_scale_learnable = image_cross_attention_scale_learnable
+        if mult and image_cross_attention_scale_learnable:
+            self.pixel_shuffle = nn.PixelUnshuffle(mult)
 
 
     def forward(self, x, context=None, mask=None, **kwargs):
         ## implementation tricks: because checkpointing doesn't support non-tensor (e.g. None or scalar) arguments
         input_tuple = (x,)      ## should not be (x), otherwise *input_tuple will decouple x into multiple arguments
         if context is not None:
-            input_tuple = (x, context)
+            if self.image_cross_attention_scale_learnable and kwargs:
+                plucker_embedding = self.pixel_shuffle(rearrange(kwargs['plucker_embedding'], 'b t c h w -> (b t) c h w').contiguous())
+                plucker_embedding = rearrange(plucker_embedding, 'b c h w -> b (h w) c')
+                input_tuple = (x, context, plucker_embedding)
+
+            else:
+                input_tuple = (x, context)
         if mask is not None:
             forward_mask = partial(self._forward, mask=mask)
             return checkpoint(forward_mask, (x,), self.parameters(), self.checkpoint)
         return checkpoint(self._forward, input_tuple, self.parameters(), self.checkpoint)
 
 
-    def _forward(self, x, context=None, mask=None):
+    def _forward(self, x, context=None, plucker_embedding = None, mask=None):
         x = self.attn1(self.norm1(x), context=context if self.disable_self_attn else None, mask=mask) + x
-        x = self.attn2(self.norm2(x), context=context, mask=mask) + x
+        x = self.attn2(self.norm2(x), context=context, mask=mask, cam = plucker_embedding) + x
         x = self.ff(self.norm3(x)) + x
         return x
 
@@ -407,7 +421,7 @@ class SpatialTransformer(nn.Module):
 
     def __init__(self, in_channels, n_heads, d_head, depth=1, dropout=0., context_dim=None,
                  use_checkpoint=True, disable_self_attn=False, use_linear=False, video_length=None,
-                 image_cross_attention=False, image_cross_attention_scale_learnable=False):
+                 image_cross_attention=False, image_cross_attention_scale_learnable=False,mult = None):
         super().__init__()
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
@@ -430,7 +444,8 @@ class SpatialTransformer(nn.Module):
                 attention_cls=attention_cls,
                 video_length=video_length,
                 image_cross_attention=image_cross_attention,
-                image_cross_attention_scale_learnable=image_cross_attention_scale_learnable,
+                image_cross_attention_scale_learnable=True,
+                mult = mult,
                 ) for d in range(depth)
         ])
         if not use_linear:
@@ -438,6 +453,8 @@ class SpatialTransformer(nn.Module):
         else:
             self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
         self.use_linear = use_linear
+        self.mult = mult
+
 
 
     def forward(self, x, context=None, **kwargs):

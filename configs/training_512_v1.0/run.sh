@@ -10,7 +10,7 @@ name="training_512_v1.0"
 config_file=configs/${name}/config.yaml
 
 # save root dir for logs, checkpoints, tensorboard record, etc.
-save_root="./exp_epipolar_f3"
+save_root="./exp_epipolar_f8"
 
 mkdir -p $save_root/$name
 
