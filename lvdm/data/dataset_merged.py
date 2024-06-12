@@ -299,7 +299,6 @@ class EpicAndRealestate(Dataset):
 
             # 2. get pixels
             with Image.open(os.path.join(self.epic_root, self.epic_image_subfolder, video_id, filename + '.jpg')) as img:
-                ori_h, ori_w = img.size
                 pixels.append(self.transformer(img))
             
             # 3.a get camera poses, method 1: from official json
@@ -321,8 +320,7 @@ class EpicAndRealestate(Dataset):
         plucker_embedding = _get_plucker_embedding2(
             intrinsic=intrinsic,
             extrinsic_lst=list(map(lambda x: x.numpy(), extrinsics_lst)),
-            h=self.h, w=self.w, t=self.t,
-            ori_h=ori_h, ori_w=ori_w
+            t=self.t,
         )
         # IMPORTANT!
         intrinsics = torch.tensor([
@@ -454,11 +452,10 @@ def get_relative_pose(extrinsic_lst, zero_t_first_frame=True):
         return ret_poses
 
 
-def _get_plucker_embedding2(intrinsic, extrinsic_lst, h, w, ori_h, ori_w, t):
+def _get_plucker_embedding2(intrinsic, extrinsic_lst, t):
     """
     intrinsic: (fx, fy, cx, cy)
     extrinsic_lst: list of extrinsic 4 * 4 numpy matrices
-    ori_h, ori_w: the original size of pixels before resizing
     """
 
     fx, fy, cx, cy = intrinsic

@@ -17,6 +17,7 @@ model:
     scale_factor: 0.18215
     use_ema: False
     uncond_type: 'empty_seq'
+    rand_cond_frame: false
     use_dynamic_rescale: true
     base_scale: 0.7
     fps_condition_type: 'fps'

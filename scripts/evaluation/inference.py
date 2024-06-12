@@ -15,6 +15,16 @@ from lvdm.models.samplers.ddim import DDIMSampler
 from lvdm.models.samplers.ddim_multiplecond import DDIMSampler as DDIMSampler_multicond
 from utils.utils import instantiate_from_config
 
+from lvdm.data.dataset_merged import _get_plucker_embedding2
+import json
+from lvdm.geometry.projection import get_world_rays
+from lvdm.geometry.epipolar_lines import project_rays
+from lvdm.visualization.drawing.lines import draw_attn
+
+from collections import defaultdict
+import csv
+import random
+
 
 def get_filelist(data_dir, postfixes):
     patterns = [os.path.join(data_dir, f"*.{postfix}") for postfix in postfixes]
@@ -61,6 +71,166 @@ def load_prompts(prompt_file):
         f.close()
     return prompt_list
 
+
+VIDEO_ID = 'P36_102'
+# with open(os.path.join(data_dir, 'all_pose.json')) as f:       # very big file
+with open(os.path.join('/workspace/DynamiCrafter/Epic', f'{VIDEO_ID}_ex.json')) as f:       # very big file
+    frame_to_ex = json.load(f)
+
+def index_to_keystring(index):
+    return f'frame_{str(index).zfill(10)}.jpg'
+
+
+def get_all_camera_from_pose_list(extrinsics_list, intrinsic):
+    camera_embeddings = []
+    for i, extrinsics in enumerate(extrinsics_list):
+        if i == 0:
+            base_pose = torch.inverse(extrinsics)
+        camera_embeddings.append((base_pose @ extrinsics)[:3, :].flatten())
+    camera_embeddings = torch.stack(camera_embeddings, dim = 0)
+    extrinsics = torch.stack(extrinsics_list, dim = 0)
+    plucker_embedding = _get_plucker_embedding2(
+        intrinsic=intrinsic,
+        extrinsic_lst=list(map(lambda x: x.numpy(), extrinsics_list)),
+        t=len(extrinsics_list),
+    )
+    intrinsics = torch.tensor([
+        intrinsic[0] / (2 * intrinsic[2]),
+        intrinsic[1] / (2 * intrinsic[3]),
+        0.5, 0.5, 0, 0
+    ], dtype=torch.float32)
+    
+    intrinsics = torch.unsqueeze(intrinsics, 0).to(0)
+    extrinsics = torch.unsqueeze(extrinsics, 0).to(0)
+
+    epipolar_masks = []
+    b, t, h, w = 1, 16, 40, 64
+    for s in range(3):
+        epipolar_masks.append(_calculate_attn_mask(intrinsics, extrinsics, b,t,h// 2 ** (s + 1),w// 2 ** (s + 1),None,lw =4// 2 ** s))
+
+    return {
+        'intrinsics': intrinsics,       # 6,
+        'extrinsics': extrinsics,       # T, 4, 4
+        'plucker_embedding': torch.unsqueeze(plucker_embedding, 0).to(0),     # T, 6, H, W
+        'camera_embeddings': torch.unsqueeze(camera_embeddings, 0).to(0),     # T, 12
+        'epipolar_masks': epipolar_masks,
+    }
+
+
+def get_frame_pixel_repeated(frame: int, num_frames=16, data_dir='/workspace/DynamiCrafter/Epic'):
+    transformer = transforms.Compose([
+            transforms.Resize([320, 512]),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+    filename = index_to_keystring(frame)
+    with Image.open(os.path.join(data_dir, 'epic', VIDEO_ID, filename)) as img:
+        pixels = transformer(img)
+    pixels = torch.stack([pixels] * num_frames, dim=0)
+    pixels = rearrange(pixels, 't c h w -> c t h w')
+    return torch.unsqueeze(pixels, 0).to(0)     # B, C, T, H, W
+
+
+def get_BLIP(frame: int, data_dir='/workspace/DynamiCrafter/Epic'):
+    with open(os.path.join(data_dir, 'caption_merged', VIDEO_ID + '.json')) as f:
+        data = json.load(f)
+        # round frames to existing keys
+        shift = 0
+        while (index_to_keystring(frame + shift) not in data) and (index_to_keystring(frame - shift) not in data):
+            shift += 1
+        if index_to_keystring(frame + shift) in data:
+            return data[index_to_keystring(frame + shift)]
+        else:
+            return data[index_to_keystring(frame - shift)]
+
+
+def get_list_by_stride(start, stride, length):
+    return list(range(start, start + stride * length, stride))
+
+def get_epic_data(data_dir='/workspace/DynamiCrafter/Epic', video_id='P35_101',
+    start_frame=3706, num_frames=16):
+
+    # 706 - 2400
+    # {pixel 706, caption 706 + some final frame with action label, camera pose/plucker: T=16 t0=706 hand pick}
+    # 2. get pixels
+    transformer = transforms.Compose([
+        transforms.Resize([320, 512]),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    filename = index_to_keystring(start_frame)
+    with Image.open(os.path.join(data_dir, 'epic', video_id, filename)) as img:
+        ori_w, ori_h = img.size
+        print(ori_h, ori_w)
+        # pixels.append(transformer(img))
+        pixels = transformer(img)
+    pixels = torch.stack([pixels] * num_frames, dim=0)
+
+    with open(os.path.join(data_dir, 'intrinsics.json')) as f:
+        data = json.load(f)
+        intrinsic = tuple(data[video_id])
+
+    # 706 750 790 830
+    extrinsics_lst = []
+    camera_embeddings = []
+    # frame_indices = [706, 750, 790, 830, 900, 950, 1000, 1050, 1100, 1150, 1200, 1250, 1300, 1350, 1400, 1450]
+    
+    stride = random.choice([2, 3, 5])
+    frame_indices = get_list_by_stride(start_frame, stride, num_frames)
+    assert len(frame_indices) == num_frames
+    captions = []
+    for i, index in enumerate(frame_indices):
+        filename = index_to_keystring(index)
+
+        # 1. get captions
+        if i == 0 or i == num_frames - 1:
+            # BLIP
+            with open(os.path.join(data_dir, 'caption_merged', video_id + '.json')) as f:
+                data = json.load(f)
+                # round frames to existing keys
+                shift = 0
+                while (index_to_keystring(index + shift) not in data) and (index_to_keystring(index - shift) not in data):
+                    shift += 1
+                if index_to_keystring(index + shift) in data:
+                    captions.append(data[index_to_keystring(index + shift)])
+                else:
+                    captions.append(data[index_to_keystring(index - shift)])
+
+        # 2. get extrinsics
+        extrinsics_lst.append(torch.tensor(frame_to_ex[video_id][f'{video_id}/{filename}']).float())
+        if i == 0:
+            base_pose = torch.inverse(extrinsics_lst[0])
+        camera_embeddings.append((base_pose @ extrinsics_lst[i])[:3, :].flatten())
+    
+    extrinsics = torch.stack(extrinsics_lst, dim = 0)
+    camera_embeddings = torch.stack(camera_embeddings, dim = 0)
+
+    plucker_embedding = _get_plucker_embedding2(
+        intrinsic=intrinsic,
+        extrinsic_lst=list(map(lambda x: x.numpy(), extrinsics_lst)),
+        t=num_frames,
+    )
+    # IMPORTANT!
+    intrinsics = torch.tensor([
+        intrinsic[0] / (2 * intrinsic[2]),
+        intrinsic[1] / (2 * intrinsic[3]),
+        0.5, 0.5, 0, 0
+    ], dtype=torch.float32)
+
+    text = captions[0] + ',' + captions[1]
+
+    pixels = rearrange(pixels, 't c h w -> c t h w')
+    return {
+        'pixel_values': torch.unsqueeze(pixels, 0).to(0),     # C, T, H, W
+        'text': text,     # str
+        'intrinsics': torch.unsqueeze(intrinsics, 0).to(0),       # 6,
+        'extrinsics': torch.unsqueeze(extrinsics, 0).to(0),       # T, 4, 4
+        'plucker_embedding': torch.unsqueeze(plucker_embedding, 0).to(0),     # T, 6, H, W
+        'camera_embeddings': torch.unsqueeze(camera_embeddings, 0).to(0),     # T, 12
+        'stride': stride,
+    }
+    
+   
 def load_data_prompts(data_dir, video_size=(256,256), video_frames=16, interp=False):
     transform = transforms.Compose([
         transforms.Resize(min(video_size)),
@@ -151,7 +321,8 @@ def save_results_seperate(prompt, samples, filename, fakedir, fps=10, loop=False
             grid = video[i,...]
             grid = (grid + 1.0) / 2.0
             grid = (grid * 255).to(torch.uint8).permute(1, 2, 3, 0) #thwc
-            path = os.path.join(savedirs[idx].replace('samples', 'samples_separate'), f'{filename.split(".")[0]}_sample{i}.mp4')
+            # path = os.path.join(savedirs[idx].replace('samples', 'samples_separate'), f'{filename.split(".")[0]}_sample{i}.mp4')
+            path = os.path.join(savedirs[idx].replace('samples', 'samples_separate'), filename)
             torchvision.io.write_video(path, grid, fps=fps, video_codec='h264', options={'crf': '10'})
 
 def get_latent_z(model, videos):
@@ -168,8 +339,8 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
     batch_size = noise_shape[0]
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
 
-    if not text_input:
-        prompts = [""]*batch_size
+    # if not text_input:
+    #     prompts = [""]*batch_size
 
     img = videos[:,:,0] #bchw
     img_emb = model.embedder(img) ## blc
@@ -179,13 +350,18 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
     cond = {"c_crossattn": [torch.cat([cond_emb,img_emb], dim=1)]}
     if model.model.conditioning_key == 'hybrid':
         z = get_latent_z(model, videos) # b c t h w
-        if loop or interp:
-            img_cat_cond = torch.zeros_like(z)
-            img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
-            img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
-        else:
-            img_cat_cond = z[:,:,:1,:,:]
-            img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
+        # if loop or interp:
+        #     img_cat_cond = torch.zeros_like(z)
+        #     img_cat_cond[:,:,0,:,:] = z[:,:,0,:,:]
+        #     img_cat_cond[:,:,-1,:,:] = z[:,:,-1,:,:]
+        # else:
+        #     img_cat_cond = z[:,:,:1,:,:]
+        #     img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
+
+        img_cat_cond = z[:,:,:1,:,:]
+        img_cat_cond = repeat(img_cat_cond, 'b c t h w -> b c (repeat t) h w', repeat=z.shape[2])
+
+
         cond["c_concat"] = [img_cat_cond] # b c 1 h w
     
     if unconditional_guidance_scale != 1.0:
@@ -249,6 +425,67 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
     return batch_variants.permute(1, 0, 2, 3, 4, 5)
 
 
+def _calculate_attn_mask(intrinsics, extrinsics, b, t,h,w,x=None,lw=4):
+    xs = torch.linspace(0, 1, steps=w)
+    ys = torch.linspace(0, 1, steps=h)
+    grid = torch.stack(
+        torch.meshgrid(xs, ys, indexing='xy'), dim=-1).float().to(
+        0)
+
+    grid = rearrange(grid, "h w c  -> (h w) c")
+    grid = grid.repeat(t, 1)
+    attn_mask = []
+    for b in range(b):
+        k = torch.eye(3).float().to(
+            0)
+        k[0, 0] = intrinsics[b][0]
+        k[1, 1] = intrinsics[b][1]
+        k[0, 2] = 0.5
+        k[1, 2] = 0.5
+        source_intrinsics = k
+        source_intrinsics = source_intrinsics[None].repeat_interleave(t * w * h, 0)
+
+        source_extrinsics_all = []
+        target_extrinsics_all = []
+        for t1 in range(t):
+            source_extrinsics = torch.inverse(extrinsics[b][t1].to(
+                0))
+            source_extrinsics_all.append(source_extrinsics[None].repeat_interleave(w * h, 0))
+            tmp_seq = []
+            for t2 in range(t):
+                target_extrinsics = torch.inverse(extrinsics[b][t2].to(
+                    0))
+                tmp_seq.append(target_extrinsics[None])
+            target_extrinsics_all.append(torch.cat(tmp_seq).repeat(w * h, 1, 1))
+
+        source_extrinsics_all = torch.cat(source_extrinsics_all)
+        target_extrinsics_all = torch.cat(target_extrinsics_all)
+        origin, direction = get_world_rays(grid.float(), source_extrinsics_all.float(), source_intrinsics.float())
+        origin = origin.repeat_interleave(t, 0)
+        direction = direction.repeat_interleave(t, 0)
+        source_intrinsics = source_intrinsics.repeat_interleave(t, 0)
+        projection = project_rays(
+            origin.float(), direction.float(), target_extrinsics_all.float(), source_intrinsics.float()
+        )
+
+        attn_image = torch.zeros((3, h, w)).to(
+            0).float()
+
+        attn_image = draw_attn(
+            attn_image,
+            projection["xy_min"],
+            projection["xy_max"],
+            (1, 1, 1),
+            lw,
+            x_range=(0, 1),
+            y_range=(0, 1), )
+        attn_image = attn_image
+        attn_image = rearrange(attn_image, '(t1 a t2) b-> (t1 a) (t2 b)', t1=t, t2=t)
+        attn_mask.append(attn_image)
+    attn_mask = torch.stack(attn_mask).half()
+    return  attn_mask
+
+
 def run_inference(args, gpu_num, gpu_no):
     ## model config
     config = OmegaConf.load(args.config)
@@ -285,36 +522,108 @@ def run_inference(args, gpu_num, gpu_no):
     num_samples = len(prompt_list)
     samples_split = num_samples // gpu_num
     print('Prompts testing [rank:%d] %d/%d samples loaded.'%(gpu_no, samples_split, num_samples))
-    #indices = random.choices(list(range(0, num_samples)), k=samples_per_device)
-    indices = list(range(samples_split*gpu_no, samples_split*(gpu_no+1)))
-    prompt_list_rank = [prompt_list[i] for i in indices]
-    data_list_rank = [data_list[i] for i in indices]
-    filename_list_rank = [filename_list[i] for i in indices]
 
-    start = time.time()
-    with torch.no_grad(), torch.cuda.amp.autocast():
-        for idx, indice in tqdm(enumerate(range(0, len(prompt_list_rank), args.bs)), desc='Sample Batch'):
-            prompts = prompt_list_rank[indice:indice+args.bs]
-            videos = data_list_rank[indice:indice+args.bs]
-            filenames = filename_list_rank[indice:indice+args.bs]
-            if isinstance(videos, list):
-                videos = torch.stack(videos, dim=0).to("cuda")
+    print(f'running inference on epic, video id {VIDEO_ID}')
+
+    with open('/workspace/DynamiCrafter/Epic/EPIC_100_train.csv', "r") as f:
+        epic_meta_file = csv.reader(f)
+        epic_meta_file = list(epic_meta_file)[1:] # drop the head line
+    for line in epic_meta_file:
+        video_id = line[2]
+
+        # if video_id != VIDEO_ID: continue
+        # skip if the video is missing
+        frame_dir = os.path.join('/workspace/DynamiCrafter/Epic/epic', video_id)
+        if not os.path.exists(frame_dir): continue
+        start_frame = int(line[6])
+        # end_frame = int(line[7])
+        narration = line[8]
+
+
+        # print(f'getting data from {video_id}, {start_frame}')
+        # try:
+        #     data_info = get_epic_data(
+        #         data_dir='/workspace/DynamiCrafter/Epic',
+        #         video_id=video_id,
+        #         start_frame=start_frame,
+        #         num_frames=16
+        #     )
+        # except Exception:
+        #     print(f'extrinsic missing on {video_id}, {start_frame}')
+        #     exit(0)
+        #     continue
+
+        # # calculate epipolar mask
+        # epipolar_masks = []
+        # b, t, h, w = 1, 16, 40, 64
+        # for s in range(3):
+        #     epipolar_masks.append(_calculate_attn_mask(data_info['intrinsics'], data_info['extrinsics'], b,t,h// 2 ** (s + 1),w// 2 ** (s + 1),None,lw =4// 2 ** s))
+        # data_info['epipolar_masks'] = epipolar_masks
+
+        # reading data from pt file
+        video_id = VIDEO_ID
+
+        stride = 5
+        # indices_to_read = [456, 460, 470] + get_list_by_stride(start=473, stride=3, length=13)
+        # indices_to_read = [480] + get_list_by_stride(start=485, stride=5, length=15)
+        # indices_to_read = [635, 765, 900] + get_list_by_stride(start=980, stride=3, length=13)
+        # indices_to_read = get_list_by_stride(start=470, stride=3, length=16)
+        indices_to_read = [470] + get_list_by_stride(4880, 3, 15)
+        print(f'indices: {indices_to_read}')
+        read_pt_mask = [True] * 0 + [False] * 16
+        extrinsics_list = []
+        pt_data = None
+        for index, flag in zip(indices_to_read, read_pt_mask):
+            filename = index_to_keystring(index)
+            if flag:
+                pt_data = torch.load(f'/workspace/DynamiCrafter/camera_data/{VIDEO_ID}_{filename}.pth')
+                extrinsics_list.append(pt_data['extrinsics'])
             else:
-                videos = videos.unsqueeze(0).to("cuda")
+                extrinsics_list.append(torch.tensor(frame_to_ex[video_id][f'{video_id}/{filename}']).float())
 
-            batch_samples = image_guided_synthesis(model, prompts, videos, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
-                                args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale)
+        # interpolate
+        extrinsics_list = [torch.eye(4) for _ in range(16)]
+        for i in range(16):
+            # extrinsics_list[i][2, 3] = -0.2 * i
+            extrinsics_list[i][2, 3] = -0.2 * i
 
-            ## save each example individually
+        print(extrinsics_list)
+        # assert pt_data is not None
+        with open(os.path.join('/workspace/DynamiCrafter/Epic', 'intrinsics.json')) as f:
+            data = json.load(f)
+            intrinsic = tuple(data[video_id])
+
+        # videos = get_frame_pixel_repeated(indices_to_read[0])       # repeated using 1st frame
+        videos = get_frame_pixel_repeated(470)
+        camera_data = get_all_camera_from_pose_list(extrinsics_list=extrinsics_list, intrinsic=intrinsic)
+        # prompts = pt_data['text']
+        prompts = f'{get_BLIP(indices_to_read[0])},{get_BLIP(indices_to_read[-1])},moving'
+        print(camera_data['extrinsics'])
+        start = time.time()
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            name_flag = 'selfmade'
+            print(f'prompts {prompts}')
+            batch_samples = image_guided_synthesis(
+                model, prompts, videos, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
+                args.unconditional_guidance_scale, args.cfg_img, 30 // 5, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale,
+                plucker_embedding = camera_data['plucker_embedding'],
+                extrinsics = camera_data['extrinsics'],
+                intrinsics = camera_data['intrinsics'],
+                camera_embeddings = camera_data['camera_embeddings'],
+                epipolar_masks = camera_data['epipolar_masks'],
+            )
+
+            # save each example individually
             for nn, samples in enumerate(batch_samples):
-                ## samples : [n_samples,c,t,h,w]
-                prompt = prompts[nn]
-                filename = filenames[nn]
-                # save_results(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
-                save_results_seperate(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
+                narration = 'NA'
+                print(f"saving {video_id}_{start_frame}_{narration}_{name_flag}.mp4")
+                save_results_seperate(
+                    prompts, samples,
+                    f'{video_id}_{start_frame}_{narration}_{name_flag}.mp4', fakedir, fps=8, loop=args.loop
+                )
+        print(f"Saved in {args.savedir}. Time used: {(time.time() - start):.2f} seconds")
 
-    print(f"Saved in {args.savedir}. Time used: {(time.time() - start):.2f} seconds")
-
+        exit(0)
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -328,7 +637,7 @@ def get_parser():
     parser.add_argument("--bs", type=int, default=1, help="batch size for inference, should be one")
     parser.add_argument("--height", type=int, default=512, help="image height, in pixel space")
     parser.add_argument("--width", type=int, default=512, help="image width, in pixel space")
-    parser.add_argument("--frame_stride", type=int, default=3, help="frame stride control for 256 model (larger->larger motion), FPS control for 512 or 1024 model (smaller->larger motion)")
+    parser.add_argument("--frame_stride", type=int, default=10, help="frame stride control for 256 model (larger->larger motion), FPS control for 512 or 1024 model (smaller->larger motion)")
     parser.add_argument("--unconditional_guidance_scale", type=float, default=1.0, help="prompt classifier-free guidance")
     parser.add_argument("--seed", type=int, default=123, help="seed for seed_everything")
     parser.add_argument("--video_length", type=int, default=16, help="inference video length")
@@ -339,6 +648,7 @@ def get_parser():
     parser.add_argument("--timestep_spacing", type=str, default="uniform", help="The way the timesteps should be scaled. Refer to Table 2 of the [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.")
     parser.add_argument("--guidance_rescale", type=float, default=0.0, help="guidance rescale in [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891)")
     parser.add_argument("--perframe_ae", action='store_true', default=False, help="if we use per-frame AE decoding, set it to True to save GPU memory, especially for the model of 576x1024")
+    parser.add_argument("--video_id")
 
     ## currently not support looping video and generative frame interpolation
     parser.add_argument("--loop", action='store_true', default=False, help="generate looping videos or not")

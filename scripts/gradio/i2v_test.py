@@ -2,6 +2,9 @@ import os
 import time
 from omegaconf import OmegaConf
 import torch
+import sys
+
+sys.path.append('/workspace/DynamiCrafter')
 from scripts.evaluation.funcs import load_model_checkpoint, save_videos, batch_ddim_sampling, get_latent_z
 from utils.utils import instantiate_from_config
 from huggingface_hub import hf_hub_download
