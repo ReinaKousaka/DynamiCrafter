@@ -24,6 +24,8 @@ from lvdm.visualization.drawing.lines import draw_attn
 from collections import defaultdict
 import csv
 import random
+from scipy.spatial.transform import Rotation
+import numpy as np
 
 
 def get_filelist(data_dir, postfixes):
@@ -72,15 +74,6 @@ def load_prompts(prompt_file):
     return prompt_list
 
 
-VIDEO_ID = 'P36_102'
-# with open(os.path.join(data_dir, 'all_pose.json')) as f:       # very big file
-with open(os.path.join('/workspace/DynamiCrafter/Epic', f'{VIDEO_ID}_ex.json')) as f:       # very big file
-    frame_to_ex = json.load(f)
-
-def index_to_keystring(index):
-    return f'frame_{str(index).zfill(10)}.jpg'
-
-
 def get_all_camera_from_pose_list(extrinsics_list, intrinsic):
     camera_embeddings = []
     for i, extrinsics in enumerate(extrinsics_list):
@@ -95,8 +88,8 @@ def get_all_camera_from_pose_list(extrinsics_list, intrinsic):
         t=len(extrinsics_list),
     )
     intrinsics = torch.tensor([
-        intrinsic[0] / (2 * intrinsic[2]),
-        intrinsic[1] / (2 * intrinsic[3]),
+        0.51708093,
+        0.919255,
         0.5, 0.5, 0, 0
     ], dtype=torch.float32)
     
@@ -104,9 +97,9 @@ def get_all_camera_from_pose_list(extrinsics_list, intrinsic):
     extrinsics = torch.unsqueeze(extrinsics, 0).to(0)
 
     epipolar_masks = []
-    b, t, h, w = 1, 16, 40, 64
+    b, t, h, w = 1, len(extrinsics_list), 40, 64
     for s in range(3):
-        epipolar_masks.append(_calculate_attn_mask(intrinsics, extrinsics, b,t,h// 2 ** (s + 1),w// 2 ** (s + 1),None,lw =4// 2 ** s))
+        epipolar_masks.append(_calculate_attn_mask(intrinsics, extrinsics, b, t, h // 2 ** (s + 1),w// 2 ** (s + 1),None,lw =4// 2 ** s))
 
     return {
         'intrinsics': intrinsics,       # 6,
@@ -117,120 +110,23 @@ def get_all_camera_from_pose_list(extrinsics_list, intrinsic):
     }
 
 
-def get_frame_pixel_repeated(frame: int, num_frames=16, data_dir='/workspace/DynamiCrafter/Epic'):
+def get_frame_pixel_repeated(frame_path, num_frames=16):
     transformer = transforms.Compose([
             transforms.Resize([320, 512]),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-    filename = index_to_keystring(frame)
-    with Image.open(os.path.join(data_dir, 'epic', VIDEO_ID, filename)) as img:
+    with Image.open(frame_path) as img:
         pixels = transformer(img)
     pixels = torch.stack([pixels] * num_frames, dim=0)
     pixels = rearrange(pixels, 't c h w -> c t h w')
     return torch.unsqueeze(pixels, 0).to(0)     # B, C, T, H, W
 
 
-def get_BLIP(frame: int, data_dir='/workspace/DynamiCrafter/Epic'):
-    with open(os.path.join(data_dir, 'caption_merged', VIDEO_ID + '.json')) as f:
-        data = json.load(f)
-        # round frames to existing keys
-        shift = 0
-        while (index_to_keystring(frame + shift) not in data) and (index_to_keystring(frame - shift) not in data):
-            shift += 1
-        if index_to_keystring(frame + shift) in data:
-            return data[index_to_keystring(frame + shift)]
-        else:
-            return data[index_to_keystring(frame - shift)]
-
-
 def get_list_by_stride(start, stride, length):
     return list(range(start, start + stride * length, stride))
 
-def get_epic_data(data_dir='/workspace/DynamiCrafter/Epic', video_id='P35_101',
-    start_frame=3706, num_frames=16):
 
-    # 706 - 2400
-    # {pixel 706, caption 706 + some final frame with action label, camera pose/plucker: T=16 t0=706 hand pick}
-    # 2. get pixels
-    transformer = transforms.Compose([
-        transforms.Resize([320, 512]),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-    filename = index_to_keystring(start_frame)
-    with Image.open(os.path.join(data_dir, 'epic', video_id, filename)) as img:
-        ori_w, ori_h = img.size
-        print(ori_h, ori_w)
-        # pixels.append(transformer(img))
-        pixels = transformer(img)
-    pixels = torch.stack([pixels] * num_frames, dim=0)
-
-    with open(os.path.join(data_dir, 'intrinsics.json')) as f:
-        data = json.load(f)
-        intrinsic = tuple(data[video_id])
-
-    # 706 750 790 830
-    extrinsics_lst = []
-    camera_embeddings = []
-    # frame_indices = [706, 750, 790, 830, 900, 950, 1000, 1050, 1100, 1150, 1200, 1250, 1300, 1350, 1400, 1450]
-    
-    stride = random.choice([2, 3, 5])
-    frame_indices = get_list_by_stride(start_frame, stride, num_frames)
-    assert len(frame_indices) == num_frames
-    captions = []
-    for i, index in enumerate(frame_indices):
-        filename = index_to_keystring(index)
-
-        # 1. get captions
-        if i == 0 or i == num_frames - 1:
-            # BLIP
-            with open(os.path.join(data_dir, 'caption_merged', video_id + '.json')) as f:
-                data = json.load(f)
-                # round frames to existing keys
-                shift = 0
-                while (index_to_keystring(index + shift) not in data) and (index_to_keystring(index - shift) not in data):
-                    shift += 1
-                if index_to_keystring(index + shift) in data:
-                    captions.append(data[index_to_keystring(index + shift)])
-                else:
-                    captions.append(data[index_to_keystring(index - shift)])
-
-        # 2. get extrinsics
-        extrinsics_lst.append(torch.tensor(frame_to_ex[video_id][f'{video_id}/{filename}']).float())
-        if i == 0:
-            base_pose = torch.inverse(extrinsics_lst[0])
-        camera_embeddings.append((base_pose @ extrinsics_lst[i])[:3, :].flatten())
-    
-    extrinsics = torch.stack(extrinsics_lst, dim = 0)
-    camera_embeddings = torch.stack(camera_embeddings, dim = 0)
-
-    plucker_embedding = _get_plucker_embedding2(
-        intrinsic=intrinsic,
-        extrinsic_lst=list(map(lambda x: x.numpy(), extrinsics_lst)),
-        t=num_frames,
-    )
-    # IMPORTANT!
-    intrinsics = torch.tensor([
-        intrinsic[0] / (2 * intrinsic[2]),
-        intrinsic[1] / (2 * intrinsic[3]),
-        0.5, 0.5, 0, 0
-    ], dtype=torch.float32)
-
-    text = captions[0] + ',' + captions[1]
-
-    pixels = rearrange(pixels, 't c h w -> c t h w')
-    return {
-        'pixel_values': torch.unsqueeze(pixels, 0).to(0),     # C, T, H, W
-        'text': text,     # str
-        'intrinsics': torch.unsqueeze(intrinsics, 0).to(0),       # 6,
-        'extrinsics': torch.unsqueeze(extrinsics, 0).to(0),       # T, 4, 4
-        'plucker_embedding': torch.unsqueeze(plucker_embedding, 0).to(0),     # T, 6, H, W
-        'camera_embeddings': torch.unsqueeze(camera_embeddings, 0).to(0),     # T, 12
-        'stride': stride,
-    }
-    
-   
 def load_data_prompts(data_dir, video_size=(256,256), video_frames=16, interp=False):
     transform = transforms.Compose([
         transforms.Resize(min(video_size)),
@@ -523,85 +419,67 @@ def run_inference(args, gpu_num, gpu_no):
     samples_split = num_samples // gpu_num
     print('Prompts testing [rank:%d] %d/%d samples loaded.'%(gpu_no, samples_split, num_samples))
 
-    print(f'running inference on epic, video id {VIDEO_ID}')
+    print(f'running inference on RealEstate')
+    stride = 5
 
-    with open('/workspace/DynamiCrafter/Epic/EPIC_100_train.csv', "r") as f:
-        epic_meta_file = csv.reader(f)
-        epic_meta_file = list(epic_meta_file)[1:] # drop the head line
-    for line in epic_meta_file:
-        video_id = line[2]
+    # fetch from mat
+    import scipy.io
+    mat = scipy.io.loadmat('train.mat')
 
-        # if video_id != VIDEO_ID: continue
-        # skip if the video is missing
-        frame_dir = os.path.join('/workspace/DynamiCrafter/Epic/epic', video_id)
-        if not os.path.exists(frame_dir): continue
-        start_frame = int(line[6])
-        # end_frame = int(line[7])
-        narration = line[8]
+    keys = list(mat.keys())
 
-
-        # print(f'getting data from {video_id}, {start_frame}')
-        # try:
-        #     data_info = get_epic_data(
-        #         data_dir='/workspace/DynamiCrafter/Epic',
-        #         video_id=video_id,
-        #         start_frame=start_frame,
-        #         num_frames=16
-        #     )
-        # except Exception:
-        #     print(f'extrinsic missing on {video_id}, {start_frame}')
-        #     exit(0)
-        #     continue
-
-        # # calculate epipolar mask
-        # epipolar_masks = []
-        # b, t, h, w = 1, 16, 40, 64
-        # for s in range(3):
-        #     epipolar_masks.append(_calculate_attn_mask(data_info['intrinsics'], data_info['extrinsics'], b,t,h// 2 ** (s + 1),w// 2 ** (s + 1),None,lw =4// 2 ** s))
-        # data_info['epipolar_masks'] = epipolar_masks
-
-        # reading data from pt file
-        video_id = VIDEO_ID
-
-        stride = 5
-        # indices_to_read = [456, 460, 470] + get_list_by_stride(start=473, stride=3, length=13)
-        # indices_to_read = [480] + get_list_by_stride(start=485, stride=5, length=15)
-        # indices_to_read = [635, 765, 900] + get_list_by_stride(start=980, stride=3, length=13)
-        # indices_to_read = get_list_by_stride(start=470, stride=3, length=16)
-        indices_to_read = [470] + get_list_by_stride(4880, 3, 15)
-        print(f'indices: {indices_to_read}')
-        read_pt_mask = [True] * 0 + [False] * 16
+    def _get_extrinsics_from_plist(id, start=25):
         extrinsics_list = []
-        pt_data = None
-        for index, flag in zip(indices_to_read, read_pt_mask):
-            filename = index_to_keystring(index)
-            if flag:
-                pt_data = torch.load(f'/workspace/DynamiCrafter/camera_data/{VIDEO_ID}_{filename}.pth')
-                extrinsics_list.append(pt_data['extrinsics'])
-            else:
-                extrinsics_list.append(torch.tensor(frame_to_ex[video_id][f'{video_id}/{filename}']).float())
+        plist = mat[id]
+        for i, idx in enumerate(range(start, start + 16 * 5, 5)):
+            tmp = np.eye(4)
+            tmp[:3, :] = plist[idx][7:].reshape((3, 4))
+            extrinsics_list.append(torch.from_numpy(tmp).float())
+        return extrinsics_list
 
-        # interpolate
-        extrinsics_list = [torch.eye(4) for _ in range(16)]
-        for i in range(16):
-            # extrinsics_list[i][2, 3] = -0.2 * i
-            extrinsics_list[i][2, 3] = -0.2 * i
+    # RealEstate
+    intrinsic = torch.tensor([
+        0.51708093,
+        0.919255,
+        0.5, 0.5, 0, 0
+    ], dtype=torch.float32)
+    extrinsics_list = _get_extrinsics_from_plist('b06c5aa13f090e60')
+    for i in range(16):
+        extrinsics_list[i][0, 3] -= 2.0 / 16 * i
+        extrinsics_list[i][1, 3] -= 1.0 / 16 * i 
+        extrinsics_list[i][2, 3] -= 1.5 / 16 * i 
 
-        print(extrinsics_list)
-        # assert pt_data is not None
-        with open(os.path.join('/workspace/DynamiCrafter/Epic', 'intrinsics.json')) as f:
-            data = json.load(f)
-            intrinsic = tuple(data[video_id])
+    # extrinsics_list = [torch.eye(4)]
+    # for i in range(15):
+    #     trans = torch.eye(4)
+    #     trans[:3, :3] = torch.from_numpy(Rotation.from_euler('zyx',
+    #         [0, 0, -1],
+    #         degrees=True,
+    #     ).as_matrix())
+    #     # -z: roll
+    #     # -y: rotate right, yaw
+    #     # -x: pitch
+    #     trans[:3, 3] = torch.tensor([
+    #         -0.12,
+    #         +0.08,
+    #         -0.15
+    #     ])
+    #     extrinsics_list.append(trans @ extrinsics_list[-1])
 
-        # videos = get_frame_pixel_repeated(indices_to_read[0])       # repeated using 1st frame
-        videos = get_frame_pixel_repeated(470)
-        camera_data = get_all_camera_from_pose_list(extrinsics_list=extrinsics_list, intrinsic=intrinsic)
-        # prompts = pt_data['text']
-        prompts = f'{get_BLIP(indices_to_read[0])},{get_BLIP(indices_to_read[-1])},moving'
-        print(camera_data['extrinsics'])
+    torch.save(extrinsics_list, f'results/x.pt')
+
+    # videos = get_frame_pixel_repeated(f'last_frame.png')
+    videos = get_frame_pixel_repeated(f'/root/DynamiCrafter/plot2/190223367.jpg')
+    camera_data = get_all_camera_from_pose_list(extrinsics_list=extrinsics_list, intrinsic=intrinsic)
+
+    # prompts = 'white wall with a bedroom'
+    # prompts = 'street, trees, and houses'
+    # prompts = 'trees, houses, snow ground'
+    prompts = 'an aerial view of a residential neighborhood with cars parked on the street'
+
+    for trail in range(10):     # draw N times
         start = time.time()
         with torch.no_grad(), torch.cuda.amp.autocast():
-            name_flag = 'selfmade'
             print(f'prompts {prompts}')
             batch_samples = image_guided_synthesis(
                 model, prompts, videos, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
@@ -616,14 +494,15 @@ def run_inference(args, gpu_num, gpu_no):
             # save each example individually
             for nn, samples in enumerate(batch_samples):
                 narration = 'NA'
-                print(f"saving {video_id}_{start_frame}_{narration}_{name_flag}.mp4")
+                key=0
+                start_idx=16
+                print(f"saving {key}_{start_idx}_{trail}.mp4")
                 save_results_seperate(
                     prompts, samples,
-                    f'{video_id}_{start_frame}_{narration}_{name_flag}.mp4', fakedir, fps=8, loop=args.loop
+                    f'{key}_{start_idx}_{trail}.mp4', fakedir, fps=8, loop=args.loop
                 )
         print(f"Saved in {args.savedir}. Time used: {(time.time() - start):.2f} seconds")
 
-        exit(0)
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -648,7 +527,6 @@ def get_parser():
     parser.add_argument("--timestep_spacing", type=str, default="uniform", help="The way the timesteps should be scaled. Refer to Table 2 of the [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891) for more information.")
     parser.add_argument("--guidance_rescale", type=float, default=0.0, help="guidance rescale in [Common Diffusion Noise Schedules and Sample Steps are Flawed](https://huggingface.co/papers/2305.08891)")
     parser.add_argument("--perframe_ae", action='store_true', default=False, help="if we use per-frame AE decoding, set it to True to save GPU memory, especially for the model of 576x1024")
-    parser.add_argument("--video_id")
 
     ## currently not support looping video and generative frame interpolation
     parser.add_argument("--loop", action='store_true', default=False, help="generate looping videos or not")

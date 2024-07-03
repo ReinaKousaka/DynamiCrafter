@@ -1,10 +1,10 @@
 #!bin/bash
 version=512 ##1024, 512, 256
-seed=111
+seed=120
 name=dynamicrafter_512_seed${seed}
 
 
-ckpt="/workspace/DynamiCrafter/epoch=2-step=13581-weight.ckpt.ckpt"
+ckpt="/root/DynamiCrafter/realestat-beta2-epoch=12-step=21073-weight.ckpt.ckpt"
 # ckpt="/workspace/DynamiCrafter/epoch=0-step=4527-weight.ckpt.ckpt"
 # ckpt="/workspace/epoch=4-step=22635-weight.ckpt"
 # ckpt="/workspace/DynamiCrafter/model.ckpt"

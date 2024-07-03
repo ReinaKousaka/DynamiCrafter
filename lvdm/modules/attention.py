@@ -290,7 +290,8 @@ class CrossAttention(nn.Module):
         if out_ip is not None:
             if self.image_cross_attention_scale_learnable and cam is not None:
                 beta_z = self.act(self.cc_proj(torch.cat([x,cam],dim=-1)))
-                out = out + self.image_cross_attention_scale * out_ip * beta_z
+                out = beta_z * out + self.image_cross_attention_scale * out_ip
+                print(f'betaz: {beta_z.shape}')
             else:
                 out = out + self.image_cross_attention_scale * out_ip
         

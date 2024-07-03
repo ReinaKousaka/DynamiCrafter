@@ -452,15 +452,39 @@ def get_relative_pose(extrinsic_lst, zero_t_first_frame=True):
         return ret_poses
 
 
+# def _get_plucker_embedding2(intrinsic, extrinsic_lst, t):
+#     """
+#     intrinsic: (fx, fy, cx, cy)
+#     extrinsic_lst: list of extrinsic 4 * 4 numpy matrices
+#     """
+
+#     fx, fy, cx, cy = intrinsic
+#     intrinsics = np.array([fx/228*32, fy/128.0*20, cx/228*32, cy/128.0*20], dtype=np.float32)
+#     # print(f'epic origin {intrinsics}')
+#     intrinsics = torch.tensor(intrinsics).repeat(t, 1)
+#     intrinsics = torch.unsqueeze(intrinsics, dim=0).numpy()     # [1, t, 4]
+
+#     c2w_poses = get_relative_pose(extrinsic_lst)
+#     c2w = torch.as_tensor(c2w_poses)[None]                          # [1, t, 4, 4]
+
+#     return ray_condition(
+#             intrinsics,
+#             c2w,
+#             40,
+#             64,
+#             device='cpu'
+#     )[0].permute(0, 3, 1, 2).contiguous()
+
+
+# realestate
 def _get_plucker_embedding2(intrinsic, extrinsic_lst, t):
     """
     intrinsic: (fx, fy, cx, cy)
     extrinsic_lst: list of extrinsic 4 * 4 numpy matrices
     """
 
-    fx, fy, cx, cy = intrinsic
-    intrinsics = np.array([fx/228*32, fy/128.0*20, cx/228*32, cy/128.0*20], dtype=np.float32)
-    # print(f'epic origin {intrinsics}')
+    fx, fy, cx, cy = intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3]
+    intrinsics = np.array([fx*64, fy*40, cx*64, cy*40], dtype=np.float32)
     intrinsics = torch.tensor(intrinsics).repeat(t, 1)
     intrinsics = torch.unsqueeze(intrinsics, dim=0).numpy()     # [1, t, 4]
 
