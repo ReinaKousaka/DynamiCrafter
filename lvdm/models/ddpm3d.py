@@ -1283,16 +1283,16 @@ class LatentVisualDiffusion(LatentDiffusion):
         """ configure_optimizers for LatentDiffusion """
         lr = self.learning_rate
 
-        # params = list(self.model.parameters())
+        params = list(self.model.parameters())
 
-        params = []
-        params_new = []
-        for name, param in self.model.named_parameters():
-            if 'cc_proj' in name or "Epipolar" in name:
-                params_new.append(param)
+        # params = []
+        # params_new = []
+        # for name, param in self.model.named_parameters():
+        #     if 'cc_proj' in name or "Epipolar" in name:
+        #         params_new.append(param)
                 
-            else:
-                params.append(param)
+        #     else:
+        #         params.append(param)
         # print(params_new)
         mainlogger.info(f"@Training [{len(params)}] Full Paramters.")
 
@@ -1313,9 +1313,9 @@ class LatentVisualDiffusion(LatentDiffusion):
                 params.append(self.logvar)
 
         ## optimizer
-        # optimizer = torch.optim.AdamW(params, lr=lr)
-        optimizer = torch.optim.AdamW([ {"params": params},
-                                       {"params": params_new, "lr": lr*8},], lr=lr)
+        optimizer = torch.optim.AdamW(params, lr=lr)
+        # optimizer = torch.optim.AdamW([ {"params": params},
+        #                                {"params": params_new, "lr": lr*2},], lr=lr*2)
 
         ## lr scheduler
         if self.use_scheduler:

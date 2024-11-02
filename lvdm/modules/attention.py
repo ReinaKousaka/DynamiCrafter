@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from packaging import version
 from torch import einsum, nn
+from xformers.components.attention import ScaledDotProduct
 
 # constants
 
@@ -290,8 +291,8 @@ class CrossAttention(nn.Module):
         if out_ip is not None:
             if self.image_cross_attention_scale_learnable and cam is not None:
                 beta_z = self.act(self.cc_proj(torch.cat([x,cam],dim=-1)))
-                out = beta_z * out + self.image_cross_attention_scale * out_ip
-                print(f'betaz: {beta_z.shape}')
+                out =  out + self.image_cross_attention_scale * out_ip * beta_z
+                # print(f'betaz: {beta_z.shape}')
             else:
                 out = out + self.image_cross_attention_scale * out_ip
         
@@ -726,7 +727,7 @@ class CrossAttention_Epipolar(nn.Module):
         else:
             ## only used for spatial attention, while NOT for temporal attention
             if XFORMERS_IS_AVAILBLE and temporal_length is None:
-                self.forward = self.forward
+                self.forward = self.efficient_forward
 
         self.video_length = video_length
         self.image_cross_attention = image_cross_attention
@@ -738,6 +739,7 @@ class CrossAttention_Epipolar(nn.Module):
             self.to_v_ip = nn.Linear(context_dim, inner_dim, bias=False)
             if image_cross_attention_scale_learnable:
                 self.register_parameter('alpha', nn.Parameter(torch.tensor(0.)))
+        self.att = ScaledDotProduct()
 
     def forward(self, x, context=None, mask=None):
         spatial_self_attn = (context is None)
@@ -833,14 +835,8 @@ class CrossAttention_Epipolar(nn.Module):
         # actually compute the attention, what we cannot get enough of
         h = self.heads
         if exists(mask):
-            # min_val_fp16 = torch.finfo(torch.float16).min
-            mask[mask == 0] = -1000
-            mask[mask != -1000] = 0
-            mask = mask.repeat_interleave(h,0).to(q.dtype)
-            out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=mask, op=None)
-
-        else:
-            out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None)
+            mask = (mask > 0.5)
+            out = self.att(q=q, k=k, v=v, mask=mask)
 
         ## for image cross-attention
         if k_ip is not None:
